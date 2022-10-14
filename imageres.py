@@ -5,11 +5,16 @@ from skimage import io
 import os
 mnist_train = torchvision.datasets.MNIST('./datasets_folder/MNIST_data', train=True, download=True)#首先下载数据集，并数据分割成训练集与数据集
 mnist_test = torchvision.datasets.MNIST('./datasets_folder/MNIST_data', train=False, download=True)
+diffusion_path = "./datasets_folder/mnist/train_diffusion"
+os.makedirs(diffusion_path)
+diffusion_step = 10
  
 f=open("./datasets_folder/mnist/mnist_train.txt", 'w+')#在指定路径之下生成.txt文件
 """这个是对相同的数据保存在同一个文件夹下"""
 for i, (img, label) in enumerate(mnist_train):
     img_path = "./datasets_folder/mnist/mnist_train"+"/"+str(label)
+    if i % diffusion_step == 0:
+        io.imsave(diffusion_path+"/" + str(i) + ".jpg", img)
     # 判断结果
     if not os.path.exists(img_path):
         # 如果不存在则创建目录

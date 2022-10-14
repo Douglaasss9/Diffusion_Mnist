@@ -395,6 +395,17 @@ def extract(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+def extract_enhance(a, t, e, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t) / a[e]
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+def extract_enhance2(a, t, e, rate, x_shape):
+    b, *_ = t.shape
+    minus = rate * a[e]
+    out = a.gather(-1, t) 
+    return out.reshape(b, *((1,) * (len(x_shape) - 1))) - minus
+
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
@@ -413,13 +424,14 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
-class GaussianDiffusion(nn.Module):
+class GaussianDiffusion_enhance(nn.Module):
     def __init__(
         self,
         model,
         *,
         image_size,
         timesteps = 1000,
+        enhancesteps = 100,
         sampling_timesteps = None,
         loss_type = 'l1',
         objective = 'pred_noise',
@@ -429,33 +441,33 @@ class GaussianDiffusion(nn.Module):
         ddim_sampling_eta = 1.
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not (type(self) == GaussianDiffusion_enhance and model.channels != model.out_dim)
         assert not model.learned_sinusoidal_cond
 
         self.model = model
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
-
+        self.enhancesteps = enhancesteps
         self.image_size = image_size
 
         self.objective = objective
+        all_step = timesteps + enhancesteps
 
         assert objective in {'pred_noise', 'pred_x0'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start)'
 
         if beta_schedule == 'linear':
-            betas = linear_beta_schedule(timesteps)
+            betas = linear_beta_schedule(all_step)
         elif beta_schedule == 'cosine':
-            betas = cosine_beta_schedule(timesteps)
+            betas = cosine_beta_schedule(all_step)
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
         alphas = 1. - betas
-        
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
-        timesteps, = betas.shape
-        print(timesteps)
+        all_step, = betas.shape
+        timesteps = all_step - enhancesteps
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
@@ -472,16 +484,25 @@ class GaussianDiffusion(nn.Module):
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
         register_buffer('betas', betas)
+        # register_buffer('betas', betas[enhancesteps:])
         register_buffer('alphas_cumprod', alphas_cumprod)
+        # register_buffer('alphas_cumprod', alphas_cumprod[enhancesteps:])
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        # register_buffer('alphas_cumprod_prev', alphas_cumprod_prev[enhancesteps:])
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
 
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        # register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod[enhancesteps:]))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        # register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod[enhancesteps:]))
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        # register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod[enhancesteps:]))
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        # register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod[enhancesteps:]))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+        # register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod[enhancesteps:] - 1))
+
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
 
@@ -583,7 +604,7 @@ class GaussianDiffusion(nn.Module):
         img = torch.randn(shape, device = device)
 
         x_start = None
-        print(time_pairs)
+
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
             
@@ -610,6 +631,44 @@ class GaussianDiffusion(nn.Module):
         return img
 
     @torch.no_grad()
+    def denoise(self, img, batch, clip_denoised = True):
+        device, total_timesteps, sampling_timesteps, eta, objective = self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+        img = img.to(device)
+        times = torch.linspace(-1, self.enhancesteps, steps= math.floor(self.enhancesteps / 4))   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = clip_denoised)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+
+        img = unnormalize_to_zero_to_one(img)
+        return img
+
+
+    @torch.no_grad()
     def sample(self, batch_size = 16):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
@@ -632,11 +691,18 @@ class GaussianDiffusion(nn.Module):
         return img
 
     def q_sample(self, x_start, t, noise=None):
+        
         noise = default(noise, lambda: torch.randn_like(x_start))
+        temp = extract_enhance(self.sqrt_alphas_cumprod, t, self.enhancesteps, x_start.shape)
+        # print(extract(self.sqrt_alphas_cumprod, t, x_start.shape))
+        # print(temp)
+        # while True:
+        #     a = 1
         return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+            temp * x_start +
+            extract_enhance2(self.sqrt_one_minus_alphas_cumprod, t, self.enhancesteps, temp, x_start.shape) * noise
         )
+
 
     @property
     def loss_fn(self):
@@ -652,6 +718,7 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
+        t = t + self.enhancesteps
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -676,6 +743,8 @@ class GaussianDiffusion(nn.Module):
 
         loss = self.loss_fn(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
+
+        
 
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
         return loss.mean()

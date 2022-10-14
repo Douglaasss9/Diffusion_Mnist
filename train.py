@@ -29,6 +29,8 @@ diffusion = GaussianDiffusion(
     loss_type = 'l1'            # L1 or L2
 ).cuda()
 
+
+
 trainer = Trainer(
     diffusion,
     './datasets_folder/mnist/mnist_train/0',
@@ -40,4 +42,15 @@ trainer = Trainer(
     amp = True                        # turn on mixed precision
 )
 
+
+sampled_images = diffusion.sample(batch_size = 4)
+sampled_images.shape # (4, 3, 128, 128)
+
 trainer.train()
+
+mnist_train = torchvision.datasets.MNIST('./datasets_folder/MNIST_data', train=True, download=True)
+
+for i, (img, label) in enumerate(mnist_train):
+    if label == 0:
+        img_path = "./datasets_folder/mnist/mnist_train_denoise"+"/"+str(label)
+        img = Trainer.model.forward(img, -1, None)
