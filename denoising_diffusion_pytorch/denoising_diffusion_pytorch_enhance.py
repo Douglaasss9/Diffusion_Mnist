@@ -742,6 +742,9 @@ class GaussianDiffusion_enhance(nn.Module):
             raise ValueError(f'unknown objective {self.objective}')
 
         loss = self.loss_fn(model_out, target, reduction = 'none')
+        if isnan(loss):
+            print(model_output)
+            print(target)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
         
@@ -911,8 +914,11 @@ class Trainer(object):
                     with self.accelerator.autocast():
                         loss = self.model(data)
                         loss = loss / self.gradient_accumulate_every
+                        if isnan(loss):
+                            continue
                         total_loss += loss.item()
 
+                    if isnan(loss)
                     self.accelerator.backward(loss)
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
